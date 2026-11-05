@@ -38,15 +38,13 @@ async def cmd_start(message: types.Message):
         "👋 **Вітаю в автономному боті Balaloum!**\n\n"
         "📁 **Як почати:**\n"
         "1. Надішліть сюди актуальний файл з остатками (Excel `.xlsx` або **PDF**).\n"
-        "2. Бот збереже та розпарсить дані.\n"
-        "3. Переконайтеся, що фото у Фотобанку підписані артикулом.\n\n"
-        "Натисніть кнопку нижче для генерації публікації!",
+        "2. Бот розпарсить товари за підсумковою кількістю.\n"
+        "3. Натисніть кнопку нижче для генерації автопоста!",
         reply_markup=main_keyboard(),
         parse_mode="Markdown",
     )
 
 
-# Прием файлов (Excel или PDF)
 @dp.message(F.document)
 async def handle_document_upload(message: types.Message):
     document = message.document
@@ -62,7 +60,6 @@ async def handle_document_upload(message: types.Message):
 
     try:
         if file_name.endswith(".pdf"):
-            # Извлекаем таблицы из PDF и собираем в единый DataFrame через pandas
             tables_data = []
             with pdfplumber.open(downloaded_path) as pdf:
                 for page in pdf.pages:
@@ -70,49 +67,44 @@ async def handle_document_upload(message: types.Message):
                     if table:
                         tables_data.extend(table)
             
-            if len(tables_data) > 1:
-                df = pd.DataFrame(tables_data[1:], columns=tables_data[0])
-            elif len(tables_data) == 1:
+            if len(tables_data) > 0:
                 df = pd.DataFrame(tables_data)
             else:
-                await message.answer("⚠️ У цьому PDF-файлі не вдалося знайти таблиці. Перевірте його структуру.")
+                await message.answer("⚠️ У цьому PDF-файлі не вдалося знайти таблиці.")
                 return
             
-            # Сохраняем в универсальный Excel для удобства работы бота
             df.to_excel(STOCK_FILE_PATH, index=False)
             if os.path.exists(downloaded_path):
                 os.remove(downloaded_path)
         else:
-            # Если это был обычный Excel
-            if downloaded_path != STOCK_FILE_PATH:
-                df = pd.read_excel(downloaded_path)
-                df.to_excel(STOCK_FILE_PATH, index=False)
+            df = pd.read_excel(downloaded_path)
+            df.to_excel(STOCK_FILE_PATH, index=False)
+            if downloaded_path != STOCK_FILE_PATH and os.path.exists(downloaded_path):
                 os.remove(downloaded_path)
 
         df_final = pd.read_excel(STOCK_FILE_PATH)
         total_rows = len(df_final)
         await message.answer(
-            f"✅ **Файл остатків з PDF успішно опрацьовано та збережено!**\n"
-            f"Знайдено позицій/рядків: `{total_rows}`.\n\n"
-            f"Тепер можна генерувати автопостинг.",
+            f"✅ **Файл остатків з PDF успішно збережено!**\n"
+            f"Знайдено рядків: `{total_rows}`.\n\n"
+            f"Тепер натисніть кнопку **🤖 Автопост (выбрать топ-остаток)**.",
             parse_mode="Markdown",
         )
     except Exception as e:
         await message.answer(f"⚠️ Помилка при обробці файлу: `{e}`", parse_mode="Markdown")
 
 
-# Просмотр статуса загруженных остатков
 @dp.message(F.text == "📊 Статус остатков")
 async def show_stock_status(message: types.Message):
     if not os.path.exists(STOCK_FILE_PATH):
-        await message.answer("ℹ️ Файл остатків ще не завантажено. Надішліть документ у цей чат.")
+        await message.answer("ℹ️ Файл остатків ще не завантажено.")
         return
 
     try:
         df = pd.read_excel(STOCK_FILE_PATH)
         await message.answer(
             f"📊 **Поточний стан бази:**\n"
-            f"• Усього позицій: `{len(df)}`\n"
+            f"• Усього позицій/рядків: `{len(df)}`\n"
             f"• Файл готовий до роботи.",
             parse_mode="Markdown",
         )
@@ -120,7 +112,6 @@ async def show_stock_status(message: types.Message):
         await message.answer(f"⚠️ Помилка читання файлу: `{e}`")
 
 
-# Генерация автопоста по наибольшему остатку
 @dp.message(F.text == "🤖 Автопост (выбрать топ-остаток)")
 @dp.message(Command("auto_post"))
 async def generate_auto_post(message: types.Message):
@@ -133,41 +124,60 @@ async def generate_auto_post(message: types.Message):
     try:
         df = pd.read_excel(STOCK_FILE_PATH)
 
-        art_col = None
-        qty_col = None
-        price_col = None
+        # Берем 1-ю колонку (индекс 0) для наименования/артикула
+        # и 4-ю колонку (индекс 3) для общего количества
+        name_col_idx = 0
+        qty_col_idx = 3 if len(df.columns) >= 4 else len(df.columns) - 1
 
-        for col in df.columns:
-            col_str = str(col).lower()
-            if any(k in col_str for k in ["арт", "модель", "код", "наименование", "товар"]):
-                art_col = col
-            elif any(k in col_str for k in ["остаток", "кол-во", "количество", "залишок", "шт", "к-во"]):
-                qty_col = col
-            elif any(k in col_str for k in ["цена", "ціна", "стоимость"]):
-                price_col = col
+        parsed_items = []
 
-        if not art_col:
-            art_col = df.columns[0]
-        if not qty_col and len(df.columns) > 1:
-            qty_col = df.columns[1]
+        for idx, row in df.iterrows():
+            raw_name = str(row.iloc[name_col_idx]).strip()
+            raw_qty = str(row.iloc[qty_col_idx]).strip()
 
-        # Превращаем количество в числа для корректной сортировки
-        df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0)
-        df_sorted = df.sort_values(by=qty_col, ascending=False)
-        top_item = df_sorted.iloc[0]
+            # Игнорируем служебные строки ("Белье", "Наименование", "Итого" и т.д.)
+            if not raw_name or any(k in raw_name.lower() for k in ["белье", "наименование", "итого", "баланс"]):
+                continue
 
-        article = str(top_item[art_col]).strip()
-        quantity = top_item[qty_col]
-        price = top_item[price_col] if price_col and price_col in df.columns else "Запитуйте у менеджера"
+            # Преобразуем количество в число
+            clean_qty_str = re.sub(r"[^\d.]", "", raw_qty)
+            try:
+                qty_val = float(clean_qty_str) if clean_qty_str else 0.0
+            except ValueError:
+                qty_val = 0.0
+
+            if qty_val <= 0:
+                continue
+
+            # Ищем номер артикула в строке (например, 9063, 9362, 9063c)
+            art_match = re.search(r"(\d{3,5}\s?[a-zA-Zа-яА-Я]?)", raw_name)
+            article_code = art_match.group(1).replace(" ", "") if art_match else raw_name
+
+            parsed_items.append({
+                "raw_name": raw_name,
+                "article": article_code,
+                "quantity": qty_val
+            })
+
+        if not parsed_items:
+            await message.answer("⚠️ Не вдалося витягнути товари з остатком більше 0. Перевірте файл.")
+            return
+
+        # Сортируем по убыванию общего количества (колонка "Итого")
+        parsed_items.sort(key=lambda x: x["quantity"], reverse=True)
+        top_item = parsed_items[0]
+
+        article = top_item["article"]
+        quantity = int(top_item["quantity"])
 
         post_text = (
             f"🔥 **ТОП-ПРОПОЗИЦІЯ В НАЯВНОСТІ | BALALOUM** 🔥\n\n"
-            f"🏷 **Модель:** `{article}`\n"
-            f"📦 **Залишок на складі:** `{quantity} шт`\n"
-            f"💰 **Ціна:** `{price}`\n\n"
-            f"✨ Висока якість, перевірена модель, швидка відправка.\n"
-            f"📲 Для замовлення пишіть у повідомлення.\n\n"
-            f"#{article.replace(' ', '_')} #balaloum #гурт #білизнаоптом"
+            f"🏷 **Модель / Артикул:** `{article}`\n"
+            f"📦 **Загальний залишок:** `{quantity} шт` (Найбільший запас!)\n"
+            f"💰 **Ціна:** Запитуйте у менеджера / Опт\n\n"
+            f"✨ Відмінна якість, ходові кольори в наявності.\n"
+            f"📲 Для замовлення звертайтесь до менеджерів.\n\n"
+            f"#{article} #balaloum #гурт #білизнаоптом"
         )
 
         inline_kb = InlineKeyboardMarkup(
@@ -187,19 +197,18 @@ async def generate_auto_post(message: types.Message):
         )
 
     except Exception as e:
-        await message.answer(f"⚠️ Помилка аналізу таблиці з PDF: `{e}`", parse_mode="Markdown")
+        await message.answer(f"⚠️ Помилка аналізу таблиці z PDF: `{e}`", parse_mode="Markdown")
 
 
 @dp.callback_query(F.data == "publish_auto")
 async def publish_auto_post(callback: types.CallbackQuery):
     try:
         text_to_send = callback.message.text.replace("📋 Сформовано автоматичний пост:\n\n", "")
-        # Очищаем текст от служебного хвостика про фотобанк перед отправкой в канал
         text_to_send = text_to_send.split("\n\n💡")[0]
         await bot.send_message(chat_id=CHANNEL_ID, text=text_to_send, parse_mode="Markdown")
         await callback.message.edit_text("✅ **Пост успішно опубліковано у публічний канал!**", parse_mode="Markdown")
     except Exception as e:
-        await callback.message.answer(f"⚠️ Помилка публікації: `{e}`", parse_mode="Markdown")
+        await callback.message.answer(f"⚠️ Помилка публікації: `{e}`. Перевірте, чи додано бота в канал як адміна.", parse_mode="Markdown")
 
 
 async def main():
