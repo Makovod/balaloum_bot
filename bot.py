@@ -69,7 +69,6 @@ def parse_1c_pdf_to_dataframe(pdf_path: str) -> pd.DataFrame:
     """
     Точный координатный парсер ведомости 1С (PDF) для Balaloum.
     Разбирает иерархию: Бренд -> Категория -> Модель + Чашка -> Цвет -> 4-я колонка (Итог).
-    С фильтрацией ненужных категорий (бретели, вешалки, тапочки и т.д.).
     """
     def parse_qty(val_str: str) -> int:
         if not val_str:
@@ -128,13 +127,6 @@ def parse_1c_pdf_to_dataframe(pdf_path: str) -> pd.DataFrame:
         else:
             if not model_raw or c4 <= 0:
                 continue
-            
-            # Отсекаем технические позиции и аксессуары, чтобы в топ не лезли бретели и тапочки
-            cat_lower = category.lower()
-            model_lower = model_raw.lower()
-            if any(bad in cat_lower or bad in model_lower for bad in ["аксесуар", "тапоч", "вешал", "манекен", "колгот", "спорт", "чулк", "эротик", "бретел", "косточ"]):
-                continue
-
             color_raw = label.strip() if label else "стандарт"
             clean_model = re.sub(r"\s*,\s*шт$", "", model_raw).strip()
             clean_no_year = re.sub(r"\(\s*20\d{2}\s*г?\s*\)|\(\s*\d{2}\s*г?\s*\)", "", clean_model).strip()
@@ -243,6 +235,7 @@ async def handle_channel_photo(message: types.Message):
     file_id = message.photo[-1].file_id
     db = load_photo_db()
     db[tag] = file_id
+    # Также сохраняем базовый артикул (например '9362'), если ищут без цвета
     base_art = tag.split("_")[0]
     if base_art not in db:
         db[base_art] = file_id
@@ -338,10 +331,6 @@ async def show_stock_status(message: types.Message):
 
 
 async def send_candidate_preview(chat_id: int, user_id: int, index: int = 0):
-    if not os.path.exists(STOCK_FILE_PATH):
-        await bot.send_message(chat_id, "⚠️ Спочатку завантажте PDF-файл з залишками!")
-        return
-
     df = pd.read_excel(STOCK_FILE_PATH)
     if df.empty:
         await bot.send_message(chat_id, "⚠️ База порожня. Спочатку завантажте PDF.")
@@ -394,7 +383,7 @@ async def send_candidate_preview(chat_id: int, user_id: int, index: int = 0):
     status_note = (
         f"✅ *Фото з Фотобанку знайдено за тегом `{photo_tag}`!*"
         if file_id
-        else f"💡 *Фото для `{photo_tag}` ще немає в пам'яті бота. Бот опублікує лише текстову розмірну сітку.*"
+        else f"💡 *Фото для `{photo_tag}` ще немає в пам'яті бота. Перешліть фото з підписом `{photo_tag}` у цей чат або додайте в канал Фотобанку.*"
     )
 
     full_preview_text = f"📋 **Сформовано автоматичний пост ({index + 1} з {len(df_sorted)}):**\n\n{post_text}\n\n{status_note}"
