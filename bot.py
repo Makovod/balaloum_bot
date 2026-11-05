@@ -1,220 +1,160 @@
-import os
 import re
-import logging
-import pandas as pd
 import pdfplumber
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-)
+import pandas as pd
 
-logging.basicConfig(level=logging.INFO)
+def parse_inventory_pdf(pdf_path: str, output_excel_path: str = "Balaloum_Bot_Ready.xlsx"):
+    """
+    Точный координатный парсер ведомости 1С (PDF) для бота Balaloum.
+    Сохраняет 100% точность по 4-й колонке (Итог), чашкам (B, C, D, E) и цветам.
+    Формирует готовый ключ photo_tag вида '9362_пудра' для синхронизации с Фотобанком.
+    """
+    def parse_qty(val_str: str) -> int:
+        if not val_str:
+            return 0
+        s = val_str.replace(" ", "").replace("\xa0", "").replace(",", ".")
+        try:
+            return int(round(float(s)))
+        except ValueError:
+            return 0
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@your_channel_username")
+    all_clustered_rows = []
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-STOCK_FILE_PATH = "latest_stock.xlsx"
-
-
-def main_keyboard():
-    kb = [
-        [KeyboardButton(text="🤖 Автопост (выбрать топ-остаток)")],
-        [KeyboardButton(text="📊 Статус остатков"), KeyboardButton(text="ℹ️ Инструкция")],
-    ]
-    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "👋 **Вітаю в автономному боті Balaloum!**\n\n"
-        "📁 **Як почати:**\n"
-        "1. Надішліть сюди актуальний файл з остатками (Excel `.xlsx` або **PDF**).\n"
-        "2. Бот розпарсить товари за підсумковою кількістю.\n"
-        "3. Натисніть кнопку нижче для генерації автопоста!",
-        reply_markup=main_keyboard(),
-        parse_mode="Markdown",
-    )
-
-
-@dp.message(F.document)
-async def handle_document_upload(message: types.Message):
-    document = message.document
-    file_name = document.file_name.lower()
-    
-    if not (file_name.endswith(".xlsx") or file_name.endswith(".xls") or file_name.endswith(".pdf")):
-        await message.answer("⚠️ Будь ласка, надішліть файл у форматі Excel (`.xlsx`) або **PDF**.")
-        return
-
-    file_info = await bot.get_file(document.file_id)
-    downloaded_path = "temp_file" + os.path.splitext(file_name)[1]
-    await bot.download_file(file_info.file_path, downloaded_path)
-
-    try:
-        if file_name.endswith(".pdf"):
-            tables_data = []
-            with pdfplumber.open(downloaded_path) as pdf:
-                for page in pdf.pages:
-                    table = page.extract_table()
-                    if table:
-                        tables_data.extend(table)
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            words = page.extract_words(keep_blank_chars=True, x_tolerance=3, y_tolerance=2)
+            # Группируем слова по строкам (координата top / Y с допуском 3.0 пт)
+            lines_by_y = []
+            words.sort(key=lambda w: (round(w['top'], 1), w['x0']))
             
-            if len(tables_data) > 0:
-                df = pd.DataFrame(tables_data)
-            else:
-                await message.answer("⚠️ У цьому PDF-файлі не вдалося знайти таблиці.")
-                return
-            
-            df.to_excel(STOCK_FILE_PATH, index=False)
-            if os.path.exists(downloaded_path):
-                os.remove(downloaded_path)
+            for w in words:
+                y = w['top']
+                x = w['x0']
+                text = w['text'].strip()
+                if not text:
+                    continue
+                if not lines_by_y:
+                    lines_by_y.append([w])
+                else:
+                    prev_y = sum(item['top'] for item in lines_by_y[-1]) / len(lines_by_y[-1])
+                    if abs(y - prev_y) <= 3.2:
+                        lines_by_y[-1].append(w)
+                    else:
+                        lines_by_y.append([w])
+
+            for line_words in lines_by_y:
+                line_words.sort(key=lambda w: w['x0'])
+                # Разделяем на левую текстовую колонку (x0 < 240) и 4 числовые колонки складов
+                left_words = [w for w in line_words if w['x0'] < 240]
+                col1_words = [w for w in line_words if 245 <= w['x0'] < 325]  # Ангар 278
+                col2_words = [w for w in line_words if 325 <= w['x0'] < 400]  # Синяя СКЛАД
+                col3_words = [w for w in line_words if 400 <= w['x0'] < 480]  # СКЛАД
+                col4_words = [w for w in line_words if w['x0'] >= 480]        # Итог (4-я колонка)
+
+                left_x = round(left_words[0]['x0'], 1) if left_words else None
+                left_text = " ".join(w['text'] for w in left_words).strip()
+
+                c1 = parse_qty("".join(w['text'] for w in col1_words))
+                c2 = parse_qty("".join(w['text'] for w in col2_words))
+                c3 = parse_qty("".join(w['text'] for w in col3_words))
+                c4 = parse_qty("".join(w['text'] for w in col4_words))
+
+                all_clustered_rows.append((page_idx + 1, left_x, left_text, c1, c2, c3, c4))
+
+    brand = ""
+    category = ""
+    model_raw = ""
+    records = []
+
+    cup_map = {'В': 'B', 'B': 'B', 'С': 'C', 'C': 'C', 'D': 'D', 'Е': 'E', 'E': 'E'}
+
+    for page_num, x_val, label, c1, c2, c3, c4 in all_clustered_rows:
+        # Пропускаем шапку и общий итог документа (X ~ 37.9)
+        if x_val is not None and x_val < 41.0:
+            continue
+        # Уровень Бренда (X ~ 44.8: Balaloum, Ang Gee, Аксесуары и т.д.)
+        elif x_val is not None and 41.0 <= x_val < 48.0:
+            brand = label.rstrip(" ,")
+            category = "Основное"
+        # Уровень Модели (заканчивается на 'шт')
+        elif label.endswith("шт"):
+            model_raw = label
+        # Уровень Категории (X ~ 51.6: Бюсты, Комплекты, Трусы, Боди, Подвязка)
+        elif x_val is not None and 48.0 <= x_val < 55.0 and not label.endswith("шт"):
+            category = label.rstrip(" ,")
+        # Уровень Цвета / конкретной позиции (X ~ 58.4 или 65.3, либо пустая строка без цвета)
         else:
-            df = pd.read_excel(downloaded_path)
-            df.to_excel(STOCK_FILE_PATH, index=False)
-            if downloaded_path != STOCK_FILE_PATH and os.path.exists(downloaded_path):
-                os.remove(downloaded_path)
-
-        df_final = pd.read_excel(STOCK_FILE_PATH)
-        total_rows = len(df_final)
-        await message.answer(
-            f"✅ **Файл остатків з PDF успішно збережено!**\n"
-            f"Знайдено рядків: `{total_rows}`.\n\n"
-            f"Тепер натисніть кнопку **🤖 Автопост (выбрать топ-остаток)**.",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await message.answer(f"⚠️ Помилка при обробці файлу: `{e}`", parse_mode="Markdown")
-
-
-@dp.message(F.text == "📊 Статус остатков")
-async def show_stock_status(message: types.Message):
-    if not os.path.exists(STOCK_FILE_PATH):
-        await message.answer("ℹ️ Файл остатків ще не завантажено.")
-        return
-
-    try:
-        df = pd.read_excel(STOCK_FILE_PATH)
-        await message.answer(
-            f"📊 **Поточний стан бази:**\n"
-            f"• Усього позицій/рядків: `{len(df)}`\n"
-            f"• Файл готовий до роботи.",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await message.answer(f"⚠️ Помилка читання файлу: `{e}`")
-
-
-@dp.message(F.text == "🤖 Автопост (выбрать топ-остаток)")
-@dp.message(Command("auto_post"))
-async def generate_auto_post(message: types.Message):
-    if not os.path.exists(STOCK_FILE_PATH):
-        await message.answer("⚠️ Спочатку надішліть файл з остатками в цей чат!")
-        return
-
-    await message.answer("🔍 Аналізую остатки з PDF та шукаю модель з найбільшим запасом...")
-
-    try:
-        df = pd.read_excel(STOCK_FILE_PATH)
-
-        # Берем 1-ю колонку (индекс 0) для наименования/артикула
-        # и 4-ю колонку (индекс 3) для общего количества
-        name_col_idx = 0
-        qty_col_idx = 3 if len(df.columns) >= 4 else len(df.columns) - 1
-
-        parsed_items = []
-
-        for idx, row in df.iterrows():
-            raw_name = str(row.iloc[name_col_idx]).strip()
-            raw_qty = str(row.iloc[qty_col_idx]).strip()
-
-            # Игнорируем служебные строки ("Белье", "Наименование", "Итого" и т.д.)
-            if not raw_name or any(k in raw_name.lower() for k in ["белье", "наименование", "итого", "баланс"]):
+            if not model_raw or c4 == 0:
                 continue
+            color_raw = label.strip() if label else "стандарт"
 
-            # Преобразуем количество в число
-            clean_qty_str = re.sub(r"[^\d.]", "", raw_qty)
-            try:
-                qty_val = float(clean_qty_str) if clean_qty_str else 0.0
-            except ValueError:
-                qty_val = 0.0
+            # Очищаем название модели от ', шт' и года '(23 г)', '(26г)'
+            clean_model = re.sub(r'\s*,\s*шт$', '', model_raw).strip()
+            clean_no_year = re.sub(r'\(\s*20\d{2}\s*г?\s*\)|\(\s*\d{2}\s*г?\s*\)', '', clean_model).strip()
+            clean_no_year = re.sub(r'\s+', ' ', clean_no_year)
 
-            if qty_val <= 0:
-                continue
+            # Определяем чашку (B, C, D, E)
+            cup = "-"
+            actual_color = color_raw
+            m_col_cup = re.match(r'^([BВCСDЕE])\s*,\s*(.+)$', color_raw)
+            if m_col_cup:
+                cup = cup_map.get(m_col_cup.group(1), m_col_cup.group(1))
+                actual_color = m_col_cup.group(2).strip()
+            else:
+                m_cup = re.search(r'(?:\d)\s*([BВCСDЕE])(?:\s+бюсты|\s*$)', clean_no_year)
+                if m_cup:
+                    cup = cup_map.get(m_cup.group(1), m_cup.group(1))
 
-            # Ищем номер артикула в строке (например, 9063, 9362, 9063c)
-            art_match = re.search(r"(\d{3,5}\s?[a-zA-Zа-яА-Я]?)", raw_name)
-            article_code = art_match.group(1).replace(" ", "") if art_match else raw_name
+            # Извлекаем чистый цифровой артикул (например, 9362, 9401, 9063)
+            m_art = re.search(r'(\d{3,6}(?:/\d)?)', clean_no_year)
+            article = m_art.group(1) if m_art else clean_no_year
 
-            parsed_items.append({
-                "raw_name": raw_name,
-                "article": article_code,
-                "quantity": qty_val
+            # Формируем точный тег для Фотобанка (например: 9362_пудра)
+            if actual_color and actual_color != "стандарт":
+                photo_tag = f"{article}_{actual_color.lower()}"
+            else:
+                photo_tag = f"{article}"
+
+            records.append({
+                "Бренд": brand,
+                "Категория": category,
+                "Артикул": article,
+                "Чашка": cup,
+                "Цвет": actual_color,
+                "Тег_Фотобанка": photo_tag,
+                "Модель_Полная": clean_no_year,
+                "Ангар_278": c1,
+                "Синяя_СКЛАД": c2,
+                "СКЛАД": c3,
+                "Итог_Остаток": c4
             })
 
-        if not parsed_items:
-            await message.answer("⚠️ Не вдалося витягнути товари з остатком більше 0. Перевірте файл.")
-            return
+    df_detailed = pd.DataFrame(records)
 
-        # Сортируем по убыванию общего количества (колонка "Итого")
-        parsed_items.sort(key=lambda x: x["quantity"], reverse=True)
-        top_item = parsed_items[0]
-
-        article = top_item["article"]
-        quantity = int(top_item["quantity"])
-
-        post_text = (
-            f"🔥 **ТОП-ПРОПОЗИЦІЯ В НАЯВНОСТІ | BALALOUM** 🔥\n\n"
-            f"🏷 **Модель / Артикул:** `{article}`\n"
-            f"📦 **Загальний залишок:** `{quantity} шт` (Найбільший запас!)\n"
-            f"💰 **Ціна:** Запитуйте у менеджера / Опт\n\n"
-            f"✨ Відмінна якість, ходові кольори в наявності.\n"
-            f"📲 Для замовлення звертайтесь до менеджерів.\n\n"
-            f"#{article} #balaloum #гурт #білизнаоптом"
+    # Сводная таблица для Автопостинга: группируем по (Артикул + Цвет), собирая все чашки в одну строку
+    grouped_rows = []
+    for (brd, cat, art, col, ptag), grp in df_detailed.groupby(
+        ["Бренд", "Категория", "Артикул", "Цвет", "Тег_Фотобанка"], as_index=False
+    ):
+        total_qty = int(grp["Итог_Остаток"].sum())
+        cups_breakdown = ", ".join(
+            f"{row['Чашка']} ({row['Итог_Остаток']} шт.)" if row['Чашка'] != "-" else f"{row['Итог_Остаток']} шт."
+            for _, row in grp.sort_values("Чашка").iterrows()
         )
+        grouped_rows.append({
+            "Бренд": brd,
+            "Категория": cat,
+            "Артикул": art,
+            "Цвет": col,
+            "Тег_Фотобанка": ptag,
+            "Разбивка_по_чашкам": cups_breakdown,
+            "Общий_Остаток": total_qty
+        })
 
-        inline_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🚀 Опублікувати в канал", callback_data="publish_auto"),
-                    InlineKeyboardButton(text="🔄 Інша модель", callback_data="next_auto"),
-                ]
-            ]
-        )
+    df_posting = pd.DataFrame(grouped_rows).sort_values(by="Общий_Остаток", ascending=False)
 
-        await message.answer(
-            f"📋 **Сформовано автоматичний пост:**\n\n{post_text}\n\n"
-            f"💡 *Переконайтеся, що у Фотобанку є фото з тегом `#{article}`.*",
-            reply_markup=inline_kb,
-            parse_mode="Markdown",
-        )
+    # Сохраняем в чистый Excel на 2 листа: 1) Готово для Автопоста, 2) Полная детализация по чашкам
+    with pd.ExcelWriter(output_excel_path, engine="openpyxl") as writer:
+        df_posting.to_excel(writer, sheet_name="Для_Автопоста_По_Цветам", index=False)
+        df_detailed.to_excel(writer, sheet_name="Детально_По_Чашкам", index=False)
 
-    except Exception as e:
-        await message.answer(f"⚠️ Помилка аналізу таблиці z PDF: `{e}`", parse_mode="Markdown")
-
-
-@dp.callback_query(F.data == "publish_auto")
-async def publish_auto_post(callback: types.CallbackQuery):
-    try:
-        text_to_send = callback.message.text.replace("📋 Сформовано автоматичний пост:\n\n", "")
-        text_to_send = text_to_send.split("\n\n💡")[0]
-        await bot.send_message(chat_id=CHANNEL_ID, text=text_to_send, parse_mode="Markdown")
-        await callback.message.edit_text("✅ **Пост успішно опубліковано у публічний канал!**", parse_mode="Markdown")
-    except Exception as e:
-        await callback.message.answer(f"⚠️ Помилка публікації: `{e}`. Перевірте, чи додано бота в канал як адміна.", parse_mode="Markdown")
-
-
-async def main():
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    return df_posting, df_detailed
