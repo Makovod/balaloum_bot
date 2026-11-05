@@ -64,10 +64,7 @@ def normalize_tag(text: str) -> str:
 
 
 def parse_1c_pdf_to_dataframe(pdf_path: str) -> pd.DataFrame:
-    """
-    Парсер ведомости 1С (PDF): ищет бренды, категории, модели, чашки и цвета.
-    Строго фильтрует мусор (бретели, вешалки, тапочки), оставляя белье и комплекты.
-    """
+    """Точный координатный парсер 1С ведомости по 4-й колонке (Итог) с фильтрацией мусора."""
     def parse_qty(val_str: str) -> int:
         if not val_str:
             return 0
@@ -112,9 +109,6 @@ def parse_1c_pdf_to_dataframe(pdf_path: str) -> pd.DataFrame:
     records = []
     cup_map = {"В": "B", "B": "B", "С": "C", "C": "C", "D": "D", "Е": "E", "E": "E"}
 
-    # Список ключевых слов категорий, которые НАМ НУЖНЫ (белье, комплекты, бюсты, трусы)
-    valid_categories = ["комплекты", "бюсты", "трусы", "боди", "белье"]
-
     for x_val, label, c4 in all_rows:
         if x_val is not None and x_val < 41.0:
             continue
@@ -128,8 +122,7 @@ def parse_1c_pdf_to_dataframe(pdf_path: str) -> pd.DataFrame:
         else:
             if not model_raw or c4 <= 0:
                 continue
-            
-            # Отсекаем ненужные разделы (аксессуары, тапочки, вешалки, колготки, спорт, турция и т.д.)
+
             cat_lower = category.lower()
             model_lower = model_raw.lower()
             if any(bad in cat_lower or bad in model_lower for bad in ["аксесуар", "тапоч", "вешал", "манекен", "колгот", "спорт", "чулк", "эротик", "бретел", "косточ"]):
@@ -173,7 +166,6 @@ def parse_1c_pdf_to_dataframe(pdf_path: str) -> pd.DataFrame:
     if df_det.empty:
         return df_det
 
-    # Группируем по (Артикул + Цвет), собирая чашки B, C, D вместе
     grouped = []
     for (brd, cat, art, col, ptag), grp in df_det.groupby(
         ["brand", "category", "article", "color", "photo_tag"], as_index=False
@@ -193,9 +185,7 @@ def parse_1c_pdf_to_dataframe(pdf_path: str) -> pd.DataFrame:
             "quantity": total_q,
         })
 
-    # Сортируем: сначала те позиции, к которым УЖЕ ЕСТЬ фото в базе, затем по остатку
-    df_out = pd.DataFrame(grouped)
-    return df_out.sort_values(by="quantity", ascending=False)
+    return pd.DataFrame(grouped).sort_values(by="quantity", ascending=False)
 
 
 def main_keyboard():
@@ -208,25 +198,11 @@ def main_keyboard():
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    photo_db = load_photo_db()
     await message.answer(
-        "👋 **Вітаю в автономному боті Balaloum!**\n\n"
-        "📁 **Як користуватися:**\n"
-        "1. Надішліть сюди PDF-файл з залишками.\n"
-        "2. Скиньте фото у ваш канал-Фотобанк (або сюди в чат) із підписом типу `9362_пудра`.\n"
-        "3. Натискайте **🤖 Автопост** — бот відбере гарну білизну та сформує пост із чашками та фото!",
+        "👋 **Вітаю! Бот готовий до роботи.**\n\n"
+        "1. Надішліть PDF-файл з залишками.\n"
+        "2. Натисніть **🤖 Автопост**, щоб переглянути товари та опублікувати їх у канал.",
         reply_markup=main_keyboard(),
-        parse_mode="Markdown",
-    )
-
-
-@dp.message(F.text == "ℹ️ Инструкция")
-async def show_instructions(message: types.Message):
-    await message.answer(
-        "ℹ️ **Інструкція:**\n\n"
-        "• Бот автоматично фільтрує товари, залишаючи лише комплекти та білизну з найбільшими залишками.\n"
-        "• Для підв'язки фото просто підпишіть фото в каналі-фотобанку або в чаті: `9362_пудра`.\n"
-        "• Бот сам покаже наявність по чашках (B, C, D, E) та загальну кількість.",
         parse_mode="Markdown",
     )
 
@@ -251,7 +227,7 @@ async def handle_private_photo(message: types.Message):
     caption = message.caption or ""
     tag = normalize_tag(caption)
     if not tag:
-        await message.answer("⚠️ Будь ласка, додайте підпис до фото (наприклад: `9362_пудра`), щоб бот знав, до якого товару його прив'язати.", parse_mode="Markdown")
+        await message.answer("⚠️ Будь ласка, додайте підпис до фото (наприклад: `9362_пудра`), щоб бот знав артикул.", parse_mode="Markdown")
         return
     file_id = message.photo[-1].file_id
     db = load_photo_db()
@@ -260,12 +236,7 @@ async def handle_private_photo(message: types.Message):
     if base_art not in db:
         db[base_art] = file_id
     save_photo_db(db)
-    await message.answer(
-        f"✅ **Фото успішно збережено у базу!**\n"
-        f"🏷 Тег: `{tag}`\n"
-        f"📚 Усього фото в пам'яті: `{len(db)}`",
-        parse_mode="Markdown",
-    )
+    await message.answer(f"✅ Фото збережено! Тег: `{tag}`", parse_mode="Markdown")
 
 
 @dp.message(F.document)
@@ -273,11 +244,11 @@ async def handle_document_upload(message: types.Message):
     document = message.document
     file_name = document.file_name.lower()
 
-    if not (file_name.endswith(".xlsx") or file_name.endswith(".xls") or file_name.endswith(".pdf")):
-        await message.answer("⚠️ Надішліть файл Excel (`.xlsx`) або **PDF**.")
+    if not (file_name.endswith(".xlsx") or file_name.endswith(".pdf")):
+        await message.answer("⚠️ Надішліть Excel або PDF файл.")
         return
 
-    wait_msg = await message.answer("⏳ Оброблюю файл залишків, фільтрую аксесуари...")
+    wait_msg = await message.answer("⏳ Оброблюю файл залишків...")
     file_info = await bot.get_file(document.file_id)
     downloaded_path = "temp_file" + os.path.splitext(file_name)[1]
     await bot.download_file(file_info.file_path, downloaded_path)
@@ -286,7 +257,7 @@ async def handle_document_upload(message: types.Message):
         if file_name.endswith(".pdf"):
             df = parse_1c_pdf_to_dataframe(downloaded_path)
             if df.empty:
-                await wait_msg.edit_text("⚠️ Не вдалося знайти товари у файлі.")
+                await wait_msg.edit_text("⚠️ Не вдалося знайти товари.")
                 return
             df.to_excel(STOCK_FILE_PATH, index=False)
         else:
@@ -298,18 +269,16 @@ async def handle_document_upload(message: types.Message):
 
         user_post_index[message.from_user.id] = 0
         await wait_msg.edit_text(
-            f"✅ **Готово! База залишків оновлена.**\n"
-            f"Відібрано позицій білизни: `{len(df)}`\n\n"
-            f"Натисніть кнопку **🤖 Автопост**, щоб переглянути товари.",
+            f"✅ **База оновлена!** Відібрано позицій: `{len(df)}`.\nНатисніть **🤖 Автопост**.",
             parse_mode="Markdown",
         )
     except Exception as e:
-        await wait_msg.edit_text(f"⚠️ Помилка: `{e}`", parse_mode="Markdown")
+        await wait_msg.edit_text(f"⚠️ Помилка: `{e}`")
 
 
 async def send_candidate_preview(chat_id: int, user_id: int, index: int = 0):
     if not os.path.exists(STOCK_FILE_PATH):
-        await bot.send_message(chat_id, "⚠️ Спочатку завантажте PDF-файл з залишками!")
+        await bot.send_message(chat_id, "⚠️ Спочатку надішліть PDF-файл з залишками!")
         return
 
     df = pd.read_excel(STOCK_FILE_PATH)
@@ -318,16 +287,9 @@ async def send_candidate_preview(chat_id: int, user_id: int, index: int = 0):
         return
 
     photo_db = load_photo_db()
-    df["photo_tag_str"] = df["photo_tag"].astype(str).str.lower()
-    df["article_str"] = df["article"].astype(str).str.lower()
-    df["has_photo"] = df["photo_tag_str"].isin(photo_db.keys()) | df["article_str"].isin(photo_db.keys())
-
-    # Сначала показываем те позиции, к которым есть фото в базе
-    df_sorted = df.sort_values(by=["has_photo", "quantity"], ascending=[False, False]).reset_index(drop=True)
-
-    index = index % len(df_sorted)
+    index = index % len(df)
     user_post_index[user_id] = index
-    item = df_sorted.iloc[index]
+    item = df.iloc[index]
 
     article = str(item["article"])
     color = str(item.get("color", ""))
@@ -362,10 +324,10 @@ async def send_candidate_preview(chat_id: int, user_id: int, index: int = 0):
     status_note = (
         f"✅ *Фото знайдено за тегом `{photo_tag}`!*"
         if file_id
-        else f"💡 *Фото для `{photo_tag}` ще немає. Скиньте фото з підписом `{photo_tag}` сюди в чат.*"
+        else f"💡 *Фото для `{photo_tag}` відсутнє у базі (буде опубліковано лише текст із розмірною сіткою).* "
     )
 
-    full_text = f"📋 **Попередній перегляд ({index + 1} з {len(df_sorted)}):**\n\n{post_text}\n\n{status_note}"
+    full_text = f"📋 **Попередній перегляд ({index + 1} з {len(df)}):**\n\n{post_text}\n\n{status_note}"
 
     if file_id:
         await bot.send_photo(chat_id=chat_id, photo=file_id, caption=full_text, reply_markup=inline_kb, parse_mode="Markdown")
@@ -383,7 +345,7 @@ async def generate_auto_post(message: types.Message):
 @dp.callback_query(F.data.startswith("next:"))
 async def next_auto_post(callback: types.CallbackQuery):
     next_idx = int(callback.data.split(":")[1])
-    await callback.answer("🔄 Шукаю наступну модель...")
+    await callback.answer("🔄 Наступна модель...")
     await send_candidate_preview(callback.message.chat.id, callback.from_user.id, next_idx)
 
 
@@ -391,7 +353,7 @@ async def next_auto_post(callback: types.CallbackQuery):
 async def publish_auto_post(callback: types.CallbackQuery):
     target_channel = get_target_channel_id()
     if not target_channel:
-        await callback.message.answer("⚠️ Змінна `CHANNEL_ID` не налаштована в Railway!")
+        await callback.message.answer("⚠️ Помилка: `CHANNEL_ID` не налаштовано в Railway!")
         return
 
     try:
@@ -399,12 +361,7 @@ async def publish_auto_post(callback: types.CallbackQuery):
         df = pd.read_excel(STOCK_FILE_PATH)
         photo_db = load_photo_db()
 
-        df["photo_tag_str"] = df["photo_tag"].astype(str).str.lower()
-        df["article_str"] = df["article"].astype(str).str.lower()
-        df["has_photo"] = df["photo_tag_str"].isin(photo_db.keys()) | df["article_str"].isin(photo_db.keys())
-        df_sorted = df.sort_values(by=["has_photo", "quantity"], ascending=[False, False]).reset_index(drop=True)
-
-        item = df_sorted.iloc[idx % len(df_sorted)]
+        item = df.iloc[idx % len(df)]
         article = str(item["article"])
         color = str(item.get("color", ""))
         photo_tag = str(item.get("photo_tag", f"{article}_{color}")).lower()
@@ -432,9 +389,9 @@ async def publish_auto_post(callback: types.CallbackQuery):
             await bot.send_message(chat_id=target_channel, text=clean_post_text, parse_mode="Markdown")
 
         await callback.answer("✅ Успішно опубліковано!")
-        await callback.message.answer(f"✅ **Пост `{photo_tag}` опубліковано в канал!**", parse_mode="Markdown")
+        await callback.message.answer(f"✅ Опубліковано в канал!", parse_mode="Markdown")
     except Exception as e:
-        await callback.message.answer(f"⚠️ Помилка публікації: `{e}`", parse_mode="Markdown")
+        await callback.message.answer(f"⚠️ Помилка публікації: `{e}`")
 
 
 async def main():
